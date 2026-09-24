@@ -265,6 +265,10 @@ def _extract_braced(s, start):
     ({"name":..., "arguments":{...}}), so `\\{.*?\\}` stops at the first inner
     brace and yields truncated JSON. Track depth, and respect string literals
     so a brace inside a string does not throw off the count.
+
+    If the string ends before the depth returns to zero, the model dropped its
+    closing brace(s) -- observed in practice, e.g. 65 chars where 66 were
+    expected. Close them so the payload still parses.
     """
     if start < 0 or start >= len(s) or s[start] != "{":
         return None
@@ -287,6 +291,10 @@ def _extract_braced(s, start):
             depth -= 1
             if depth == 0:
                 return s[start:i + 1]
+    # unterminated: close the open object(s) and retry. A dangling string is
+    # NOT repaired -- closing it would invent content the model never produced.
+    if depth > 0 and not in_str:
+        return s[start:] + "}" * depth
     return None
 
 
