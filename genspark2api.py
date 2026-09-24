@@ -354,6 +354,31 @@ def build_body(payload):
     }
 
 
+def is_upstream_error(text):
+    """Detect the upstream's canned failure strings.
+
+    The web session occasionally answers with a placeholder instead of a real
+    reply, e.g. "Sorry, I couldn't produce a response this turn." Returning that
+    as normal content misleads the caller, and it silently breaks tool emulation
+    (no contract line is produced). Treat it as a failure so the caller retries
+    on another account.
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    if len(t) > 300:
+        return False
+    return any(s in t for s in (
+        "couldn't produce a response",
+        "could not produce a response",
+        "unable to produce a response",
+        "please try again",
+        "something went wrong",
+        "an error occurred",
+        "服务异常", "请稍后再试", "出了点问题",
+    ))
+
+
 def parse_sse(text):
     content, deltas, throttle, err = None, [], None, None
     for line in text.split("\n"):
@@ -449,9 +474,17 @@ async def chat(req: Request):
                 acct.cooldown(3600)
                 last_err = "throttled"
                 continue
-            acct.stats["ok"] += 1
-
             full = content or joined or ""
+
+            # The upstream sometimes answers with a canned failure placeholder.
+            # Retry on another account rather than passing it off as content.
+            if is_upstream_error(full):
+                acct.stats["fail"] += 1
+                acct.cooldown(60)
+                last_err = f"upstream_placeholder: {full[:80]}"
+                continue
+
+            acct.stats["ok"] += 1
             msg = {"role": "assistant", "content": full}
             finish = "stop"
 
@@ -517,6 +550,7 @@ async def chat(req: Request):
             except Exception as e:
                 yield f'data: {json.dumps({"error": {"message": f"{type(e).__name__}: {e}"}})}\n\n'
             finally:
+                placeholder = is_upstream_error(collected)
                 if has_tools:
                     tname, targs = parse_toolcall(collected)
                     if tname:
@@ -530,12 +564,19 @@ async def chat(req: Request):
                             "function": {"arguments": json.dumps(targs, ensure_ascii=False)}}]}}
                         yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [argchunk]})}\n\n'
                         fin = "tool_calls"
+                    elif placeholder:
+                        # no contract line AND the reply is a canned failure:
+                        # surface it as an error instead of passing it as text
+                        yield f'data: {json.dumps({"error": {"message": "upstream placeholder: " + collected[:120]}})}\n\n'
+                        fin = "stop"
                     else:
                         if collected:
                             c = {"index": 0, "delta": {"content": collected}}
                             yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [c]})}\n\n'
                         fin = "stop"
                 else:
+                    if placeholder and emitted == 0:
+                        yield f'data: {json.dumps({"error": {"message": "upstream placeholder: " + collected[:120]}})}\n\n'
                     fin = "stop"
                 yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {}, "finish_reason": fin}]})}\n\n'
                 yield "data: [DONE]\n\n"
