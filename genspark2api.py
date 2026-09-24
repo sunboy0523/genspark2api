@@ -436,9 +436,10 @@ async def chat(req: Request):
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
-    # 尝试轮转（最多试 3 个号）
+    # 尝试轮转（最多试 5 个号）
+    # 上游偶发返回占位符（约 1/3 概率），需要留足重试余量
     last_err = None
-    for attempt in range(3):
+    for attempt in range(5):
         acct = pick()
         if acct is None:
             return JSONResponse(
@@ -512,44 +513,58 @@ async def chat(req: Request):
             })
 
         # 流式
-        def gen(a=acct, b=body, i=cid, cr=created, mo=model):
+        # Retries internally: a placeholder reply arrives before anything is
+        # emitted (tools are buffered; without tools we only retry while nothing
+        # has been sent), so the account can still be switched.
+        def gen(i=cid, cr=created, mo=model):
             has_tools = bool(payload.get("tools"))
             yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
-            buf, emitted = "", 0
-            collected = ""
-            try:
-                r = cffi.Session(impersonate="chrome").post(
-                    UPSTREAM, headers=a.headers(), data=json.dumps(b),
-                    proxies=a.proxies, timeout=120, stream=True)
-                for chunk in r.iter_content(chunk_size=None):
-                    if not chunk:
+            last = None
+            for _ in range(5):
+                a = pick()
+                if a is None:
+                    yield f'data: {json.dumps({"error": {"message": "所有账号都在冷却中（配额耗尽）"}})}\n\n'
+                    return
+                buf, emitted, collected = "", 0, ""
+                try:
+                    r = cffi.Session(impersonate="chrome").post(
+                        UPSTREAM, headers=a.headers(), data=json.dumps(body),
+                        proxies=a.proxies, timeout=120, stream=True)
+                    for chunk in r.iter_content(chunk_size=None):
+                        if not chunk:
+                            continue
+                        buf += chunk.decode("utf-8", "replace")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if not line.startswith("data: "):
+                                continue
+                            try:
+                                j = json.loads(line[6:])
+                            except Exception:
+                                continue
+                            if j.get("type") == "message_field_delta" and j.get("field_name") == "content":
+                                d = j.get("delta") or ""
+                                if d:
+                                    collected += d
+                                    # With tools we cannot retract content
+                                    # already sent, so buffer and decide later.
+                                    if not has_tools:
+                                        emitted += 1
+                                        yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}]})}\n\n'
+                            elif j.get("type") == "message_result" and isinstance(j.get("message"), dict):
+                                mc = j["message"].get("content") or ""
+                                if ("too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc) and emitted == 0 and not has_tools:
+                                    yield f'data: {json.dumps({"error": {"message": mc[:200]}})}\n\n'
+                except Exception as e:
+                    last = f"{type(e).__name__}: {e}"
+                    a.stats["fail"] += 1
+                    a.cooldown(30)
+                    if emitted == 0:
                         continue
-                    buf += chunk.decode("utf-8", "replace")
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        try:
-                            j = json.loads(line[6:])
-                        except Exception:
-                            continue
-                        if j.get("type") == "message_field_delta" and j.get("field_name") == "content":
-                            d = j.get("delta") or ""
-                            if d:
-                                collected += d
-                                # With tools we cannot retract content already
-                                # sent, so buffer and decide at the end.
-                                if not has_tools:
-                                    emitted += 1
-                                    yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}]})}\n\n'
-                        elif j.get("type") == "message_result" and isinstance(j.get("message"), dict):
-                            mc = j["message"].get("content") or ""
-                            if ("too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc) and emitted == 0 and not has_tools:
-                                yield f'data: {json.dumps({"error": {"message": mc[:200]}})}\n\n'
-            except Exception as e:
-                yield f'data: {json.dumps({"error": {"message": f"{type(e).__name__}: {e}"}})}\n\n'
-            finally:
+                    yield f'data: {json.dumps({"error": {"message": last}})}\n\n'
+                    return
+
                 placeholder = is_upstream_error(collected)
                 if has_tools:
                     tname, targs = parse_toolcall(collected)
@@ -563,24 +578,33 @@ async def chat(req: Request):
                             "index": 0,
                             "function": {"arguments": json.dumps(targs, ensure_ascii=False)}}]}}
                         yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [argchunk]})}\n\n'
+                        a.stats["ok"] += 1
                         fin = "tool_calls"
                     elif placeholder:
-                        # no contract line AND the reply is a canned failure:
-                        # surface it as an error instead of passing it as text
-                        yield f'data: {json.dumps({"error": {"message": "upstream placeholder: " + collected[:120]}})}\n\n'
-                        fin = "stop"
+                        a.stats["fail"] += 1
+                        a.cooldown(60)
+                        last = f"upstream_placeholder: {collected[:80]}"
+                        continue
                     else:
                         if collected:
-                            c = {"index": 0, "delta": {"content": collected}}
-                            yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [c]})}\n\n'
+                            yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": collected}, "finish_reason": None}]})}\n\n'
+                        a.stats["ok"] += 1
                         fin = "stop"
                 else:
                     if placeholder and emitted == 0:
-                        yield f'data: {json.dumps({"error": {"message": "upstream placeholder: " + collected[:120]}})}\n\n'
+                        a.stats["fail"] += 1
+                        a.cooldown(60)
+                        last = f"upstream_placeholder: {collected[:80]}"
+                        continue
+                    a.stats["ok"] += 1
                     fin = "stop"
+
                 yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {}, "finish_reason": fin}]})}\n\n'
                 yield "data: [DONE]\n\n"
-                a.stats["ok"] += 1
+                return
+
+            yield f'data: {json.dumps({"error": {"message": f"所有账号都失败: {last}"}})}\n\n'
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
