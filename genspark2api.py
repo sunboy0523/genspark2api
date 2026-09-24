@@ -485,12 +485,14 @@ async def chat(req: Request):
                 continue
             full = content or joined or ""
 
-            # The upstream sometimes answers with a canned failure placeholder.
-            # Retry on another account rather than passing it off as content.
-            if is_upstream_error(full):
+            # Retry on another account rather than passing off a placeholder or
+            # an empty reply as a real answer. With tools requested, an empty
+            # reply also means no contract line was produced.
+            if is_upstream_error(full) or not full.strip():
                 acct.stats["fail"] += 1
                 acct.cooldown(60)
-                last_err = f"upstream_placeholder: {full[:80]}"
+                last_err = (f"upstream_placeholder: {full[:80]}"
+                            if is_upstream_error(full) else "empty reply")
                 continue
 
             acct.stats["ok"] += 1
@@ -574,6 +576,8 @@ async def chat(req: Request):
                     return
 
                 placeholder = is_upstream_error(collected)
+                empty = not collected.strip()
+
                 if has_tools:
                     tname, targs = parse_toolcall(collected)
                     if tname:
@@ -588,21 +592,27 @@ async def chat(req: Request):
                         yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [argchunk]})}\n\n'
                         a.stats["ok"] += 1
                         fin = "tool_calls"
-                    elif placeholder:
+                    elif placeholder or empty:
+                        # A tool was offered but no contract line came back, and
+                        # the reply is either a canned failure or empty. Retry on
+                        # another account -- returning an empty stop here would
+                        # look like a successful answer.
                         a.stats["fail"] += 1
                         a.cooldown(60)
-                        last = f"upstream_placeholder: {collected[:80]}"
+                        last = ("upstream_placeholder: " + collected[:80]) if placeholder \
+                            else "empty reply with tools requested"
                         continue
                     else:
-                        if collected:
-                            yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": collected}, "finish_reason": None}]})}\n\n'
+                        # model answered in prose instead of calling a tool
+                        yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": collected}, "finish_reason": None}]})}\n\n'
                         a.stats["ok"] += 1
                         fin = "stop"
                 else:
-                    if placeholder and emitted == 0:
+                    if (placeholder or empty) and emitted == 0:
                         a.stats["fail"] += 1
                         a.cooldown(60)
-                        last = f"upstream_placeholder: {collected[:80]}"
+                        last = ("upstream_placeholder: " + collected[:80]) if placeholder \
+                            else "empty reply"
                         continue
                     a.stats["ok"] += 1
                     fin = "stop"
