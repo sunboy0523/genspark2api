@@ -85,9 +85,45 @@ curl http://127.0.0.1:8899/v1/chat/completions \
 
 | Endpoint | Description |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible; supports `stream: true` |
+| `POST /v1/chat/completions` | OpenAI-compatible; supports `stream: true` and `tools` (emulated — see below) |
 | `GET /v1/models` | Model list |
-| `GET /health` | Per-account status: `ready`, `cooldown_left_s`, success/failure counters |
+| `GET /health` | Per-account status: `ready`, `proxy`, `cooldown_left_s`, success/failure counters |
+
+---
+
+## Tool calling (emulated)
+
+**The upstream web session does not accept OpenAI-style `tools`.** Measured 2026-09-23:
+the parameter is accepted (HTTP 200) but silently ignored, and every model answers
+"I can't call a tool in this chat" — verified on `gpt-6-luna`, `claude-opus-5-5`,
+`gemini-3.8-flash` and `GLM-5.3`.
+
+The bridge therefore emulates tools at the gateway, the usual approach for web bridges:
+
+1. **Inject** — the tool schemas are rendered into a system prompt with a strict output
+   contract (`{"tool_call": {"name": ..., "arguments": {...}}}`).
+2. **Parse** — the model's reply is parsed back into OpenAI `tool_calls`, with
+   `finish_reason: "tool_calls"`.
+3. **Flatten** — OpenAI tool-protocol messages are rewritten before they go upstream,
+   because the native shapes are rejected with **HTTP 422**:
+   `assistant{tool_calls:[...]}` → `assistant{content: <contract line>}` and
+   `tool{tool_call_id, content}` → `user{content: "TOOL RESULT ..."}`.
+
+Both streaming and non-streaming are supported. In streaming mode the response is
+buffered when `tools` is present (content already emitted cannot be retracted), then
+emitted as `tool_calls` deltas: an id+name chunk followed by an arguments chunk.
+
+Verified end to end against the live upstream: 14/14 checks covering the call/no-call
+decision, argument fidelity, streaming reassembly, and round-tripping a tool result.
+
+### Limitations vs native function calling
+
+| Aspect | Native | This emulation |
+|---|---|---|
+| Parallel tool calls | Supported | **One per reply** (the model is told to call the first, the rest follow after its result) |
+| Argument validation | Enforced by the API | Prompt-level only |
+| Reliability | Schema-constrained | Depends on the model following the contract |
+| Streaming `tool_calls` | Native | Re-emitted as deltas (buffered first) |
 
 ---
 

@@ -16,6 +16,7 @@
 """
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -137,16 +138,219 @@ def pick():
         return a
 
 
+# ---------------------------------------------------------------- tool emulation
+# The upstream web session does NOT accept OpenAI-style `tools`. Measured
+# 2026-09-23: the parameter is accepted (HTTP 200) but ignored, and every model
+# answers "I can't call a tool here" (verified on gpt-6-luna, claude-opus-5-5,
+# gemini-3.8-flash, GLM-5.3).
+#
+# So tools are emulated at the gateway, the usual approach for web bridges:
+#   1. render the tool schemas into a system prompt with a strict output contract
+#   2. parse the model's reply back into OpenAI `tool_calls`
+#   3. flatten tool-protocol messages the upstream rejects (HTTP 422)
+#
+# Verified prerequisites: the upstream honours role=system, and the model
+# follows the output contract exactly (3/3 cases, including correctly NOT
+# calling a tool when none applies).
+
+TOOL_CONTRACT = """You have access to the following tools.
+
+To call a tool, reply with EXACTLY one line of JSON and nothing else:
+{"tool_call": {"name": "<tool_name>", "arguments": {<arguments>}}}
+
+If no tool is needed, reply normally in plain text. Never emit the JSON line
+unless you actually need a tool.
+
+Available tools:
+%s
+
+Rules:
+- Emit ONLY the JSON line when calling a tool: no prose, no markdown fences.
+- "arguments" must be a valid JSON object matching that tool's parameters.
+- One tool call per reply. If several are needed, call the first one now; the
+  remaining ones will be requested after its result comes back."""
+
+
+def render_tools(tools):
+    """Render OpenAI tool schemas into the contract prompt."""
+    lines = []
+    for t in tools:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not fn:
+            fn = t if isinstance(t, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        desc = (fn.get("description") or "").strip().replace("\n", " ")
+        params = fn.get("parameters") or {}
+        lines.append(f"- {name}: {desc}\n  arguments schema: "
+                     f"{json.dumps(params, ensure_ascii=False)}")
+    return TOOL_CONTRACT % ("\n".join(lines) if lines else "(none)")
+
+
+def inject_tools(messages, tools):
+    """Prepend the tool contract as a system message."""
+    prompt = render_tools(tools)
+    out = list(messages or [])
+    if out and out[0].get("role") == "system":
+        out[0] = {"role": "system",
+                  "content": prompt + "\n\n" + str(out[0].get("content") or "")}
+    else:
+        out.insert(0, {"role": "system", "content": prompt})
+    return out
+
+
+def normalize_tool_messages(messages):
+    """Translate OpenAI tool-protocol messages into plain chat messages.
+
+    The upstream rejects the native shapes with HTTP 422 (measured 2026-09-23):
+    an assistant message carrying `tool_calls`, or a message with role="tool".
+    Both must be flattened:
+
+      assistant{tool_calls:[...]}  -> assistant{content: <contract JSON line>}
+      tool{tool_call_id, content}  -> user{content: "TOOL RESULT ..."}
+
+    Verified: the flattened form round-trips and the model uses the result.
+    """
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+
+        if role == "tool":
+            name = m.get("name") or "tool"
+            cid = m.get("tool_call_id") or ""
+            body = m.get("content")
+            if not isinstance(body, str):
+                body = json.dumps(body, ensure_ascii=False)
+            head = f"TOOL RESULT for {name}" + (f" (call id {cid})" if cid else "")
+            out.append({"role": "user",
+                        "content": f"{head}: {body}\n"
+                                   "Use this result to answer the user's question."})
+            continue
+
+        if role == "assistant" and m.get("tool_calls"):
+            rendered = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                rendered.append(json.dumps(
+                    {"tool_call": {"name": fn.get("name"), "arguments": args}},
+                    ensure_ascii=False))
+            content = "\n".join(rendered)
+            if m.get("content"):
+                content = str(m["content"]) + "\n" + content
+            out.append({"role": "assistant", "content": content})
+            continue
+
+        clean = {"role": role, "content": m.get("content")}
+        if m.get("name") and role != "assistant":
+            clean["name"] = m["name"]
+        out.append(clean)
+    return out
+
+
+def _extract_braced(s, start):
+    """Return the substring from `start` (a '{') through its matching '}'.
+
+    A non-greedy regex is wrong here: the payload nests objects
+    ({"name":..., "arguments":{...}}), so `\\{.*?\\}` stops at the first inner
+    brace and yields truncated JSON. Track depth, and respect string literals
+    so a brace inside a string does not throw off the count.
+    """
+    if start < 0 or start >= len(s) or s[start] != "{":
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None
+
+
+TOOLCALL_KEY_RE = re.compile(r'\{\s*"tool_call"\s*:\s*\{')
+
+
+def parse_toolcall(text):
+    """Extract a tool call from the model's reply.
+
+    Returns (name, arguments_dict) or (None, None). Tolerates markdown fences
+    and surrounding prose, since models sometimes add either despite the
+    contract.
+    """
+    if not text:
+        return None, None
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s).strip()
+
+    m = TOOLCALL_KEY_RE.search(s)
+    if not m:
+        return None, None
+    outer = _extract_braced(s, m.start())
+    if not outer:
+        return None, None
+    try:
+        obj = json.loads(outer)
+    except Exception:
+        return None, None
+    inner = obj.get("tool_call")
+    if not isinstance(inner, dict):
+        return None, None
+    name = inner.get("name")
+    args = inner.get("arguments")
+    if not isinstance(name, str) or not name:
+        return None, None
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        try:
+            args = json.loads(args)
+        except Exception:
+            return None, None
+        if not isinstance(args, dict):
+            return None, None
+    return name, args
+
+
 def build_body(payload):
     m = payload.get("model") or "claude-4-5-haiku"
     m = ALIAS.get(m, m)
+    msgs = payload.get("messages") or []
+    # Always flatten OpenAI tool-protocol messages: the upstream rejects
+    # assistant.tool_calls and role="tool" with HTTP 422.
+    msgs = normalize_tool_messages(msgs)
+    tools = payload.get("tools") or []
+    if tools:
+        msgs = inject_tools(msgs, tools)
     return {
         "ai_chat_model": m,
         "ai_chat_enable_search": False,
         "ai_chat_disable_personalization": False,
         "use_moa_proxy": False, "moa_models": [], "writingContent": None,
         "sas_ask_origin": "typed", "type": "ai_chat", "is_private": True,
-        "messages": payload.get("messages") or [],
+        "messages": msgs,
     }
 
 
@@ -246,21 +450,40 @@ async def chat(req: Request):
                 last_err = "throttled"
                 continue
             acct.stats["ok"] += 1
+
+            full = content or joined or ""
+            msg = {"role": "assistant", "content": full}
+            finish = "stop"
+
+            # tool emulation: turn a parsed contract line into OpenAI tool_calls
+            if payload.get("tools"):
+                tname, targs = parse_toolcall(full)
+                if tname:
+                    msg["content"] = None
+                    msg["tool_calls"] = [{
+                        "id": "call_" + uuid.uuid4().hex[:24],
+                        "type": "function",
+                        "function": {"name": tname,
+                                     "arguments": json.dumps(targs, ensure_ascii=False)},
+                    }]
+                    finish = "tool_calls"
+
             return JSONResponse({
                 "id": cid, "object": "chat.completion", "created": created,
                 "model": model,
-                "choices": [{"index": 0, "finish_reason": "stop",
-                             "message": {"role": "assistant",
-                                         "content": content or joined or ""}}],
+                "choices": [{"index": 0, "finish_reason": finish, "message": msg}],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "x_genspark": {"account": acct.seq, "email": acct.email[:22],
-                               "upstream_status": r.status_code, "raw_len": len(t)},
+                               "upstream_status": r.status_code, "raw_len": len(t),
+                               "tool_emulated": bool(payload.get("tools"))},
             })
 
         # 流式
         def gen(a=acct, b=body, i=cid, cr=created, mo=model):
+            has_tools = bool(payload.get("tools"))
             yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
             buf, emitted = "", 0
+            collected = ""
             try:
                 r = cffi.Session(impersonate="chrome").post(
                     UPSTREAM, headers=a.headers(), data=json.dumps(b),
@@ -281,16 +504,40 @@ async def chat(req: Request):
                         if j.get("type") == "message_field_delta" and j.get("field_name") == "content":
                             d = j.get("delta") or ""
                             if d:
-                                emitted += 1
-                                yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}]})}\n\n'
+                                collected += d
+                                # With tools we cannot retract content already
+                                # sent, so buffer and decide at the end.
+                                if not has_tools:
+                                    emitted += 1
+                                    yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}]})}\n\n'
                         elif j.get("type") == "message_result" and isinstance(j.get("message"), dict):
                             mc = j["message"].get("content") or ""
-                            if ("too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc) and emitted == 0:
+                            if ("too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc) and emitted == 0 and not has_tools:
                                 yield f'data: {json.dumps({"error": {"message": mc[:200]}})}\n\n'
             except Exception as e:
                 yield f'data: {json.dumps({"error": {"message": f"{type(e).__name__}: {e}"}})}\n\n'
             finally:
-                yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
+                if has_tools:
+                    tname, targs = parse_toolcall(collected)
+                    if tname:
+                        tcid = "call_" + uuid.uuid4().hex[:24]
+                        head = {"index": 0, "delta": {"tool_calls": [{
+                            "index": 0, "id": tcid, "type": "function",
+                            "function": {"name": tname, "arguments": ""}}]}}
+                        yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [head]})}\n\n'
+                        argchunk = {"index": 0, "delta": {"tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": json.dumps(targs, ensure_ascii=False)}}]}}
+                        yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [argchunk]})}\n\n'
+                        fin = "tool_calls"
+                    else:
+                        if collected:
+                            c = {"index": 0, "delta": {"content": collected}}
+                            yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [c]})}\n\n'
+                        fin = "stop"
+                else:
+                    fin = "stop"
+                yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {}, "finish_reason": fin}]})}\n\n'
                 yield "data: [DONE]\n\n"
                 a.stats["ok"] += 1
 
