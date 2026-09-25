@@ -171,13 +171,19 @@ Grouped by upstream family; the model IDs below are the ones you pass in `"model
 | Limit | Value |
 |---|---|
 | Credits per request | **1** |
-| Daily grant | **100** credits, expires in 24 h (does not accumulate) |
+| Signup grant | **100** credits, **one-time**, expires in 24 h |
 | Rate limit | **6 requests/minute, 60/hour** per account |
 | Concurrent | **3+ → HTTP 429** |
 | 429 recovery | ~30 s (no `Retry-After` header) |
 
-Because the daily grant does not roll over, per-account daily throughput is roughly
-**100 requests**. With a pool of N accounts, throughput scales accordingly — but the
+**The 100-credit grant is issued once per account, not daily.** The ledger type is
+named `daily_gift`, which is misleading — a full read of `recharge_logs` across a
+dozen accounts shows exactly one entry per account, dated the day it was created,
+with no subsequent top-ups.
+
+The grant expires 24 h after it is issued, so an account's usable budget is roughly
+**100 requests for its entire lifetime**. There is no replenishment mechanism; a
+depleted account stays depleted. Scale comes from the number of accounts, and the
 per-account rate limit binds earlier than the credit budget.
 
 ---
